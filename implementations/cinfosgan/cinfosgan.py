@@ -1,26 +1,24 @@
 import argparse
-import os
+import os, sys
 import numpy as np
-import math
 import itertools
 import datetime
 import time
+
 
 import torchvision.transforms as transforms
 from torchvision.transforms.functional import InterpolationMode
 from torchvision.utils import save_image, make_grid
 
 from torch.utils.data import DataLoader
-from torchvision import datasets
 from torch.autograd import Variable
 
-from models import *
-from datasets import *
-from utils import *
+from models import EncoderResNet, DecoderResNet, Discriminator, ContentCodeDiscriminator, weights_init_normal
+from datasets import ImageDataset
+from utils import ReplayBuffer, LambdaLR
 
-import torch.nn as nn
-import torch.nn.functional as F
 import torch
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--epoch", type=int, default=0, help="epoch to start training from")
@@ -57,43 +55,64 @@ cuda = torch.cuda.is_available()
 input_shape = (opt.channels, opt.img_height, opt.img_width)
 
 # Initialize generator and discriminator
-G_AB = GeneratorResNet(input_shape, opt.n_residual_blocks)
-G_BA = GeneratorResNet(input_shape, opt.n_residual_blocks)
+EC_A = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
+EC_B = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
+ES_A = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
+ES_B = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
+G_A = DecoderResNet(256 * 256 * 2, input_shape, opt.n_residual_blocks)
+G_B = DecoderResNet(256 * 256 * 2, input_shape, opt.n_residual_blocks)
 D_A = Discriminator(input_shape)
 D_B = Discriminator(input_shape)
+D_S = ContentCodeDiscriminator(256 * 256)
 
 if cuda:
-    G_AB = G_AB.cuda()
-    G_BA = G_BA.cuda()
+    EC_A = EC_A.cuda()
+    EC_B = EC_B.cuda()
+    ES_A = ES_A.cuda()
+    ES_B = ES_B.cuda()
+    G_A = G_A.cuda()
+    G_B = G_B.cuda()
     D_A = D_A.cuda()
     D_B = D_B.cuda()
+    D_S = D_S.cuda()
     criterion_GAN.cuda()
     criterion_cycle.cuda()
     criterion_identity.cuda()
 
 if opt.epoch != 0:
     # Load pretrained models
-    G_AB.load_state_dict(torch.load("saved_models/%s/G_AB_%d.pth" % (opt.dataset_name, opt.epoch)))
-    G_BA.load_state_dict(torch.load("saved_models/%s/G_BA_%d.pth" % (opt.dataset_name, opt.epoch)))
+    EC_A.load_state_dict(torch.load("saved_models/%s/EC_A_%d.pth" % (opt.dataset_name, opt.epoch)))
+    EC_B.load_state_dict(torch.load("saved_models/%s/EC_B_%d.pth" % (opt.dataset_name, opt.epoch)))
+    ES_A.load_state_dict(torch.load("saved_models/%s/EC_A_%d.pth" % (opt.dataset_name, opt.epoch)))
+    ES_B.load_state_dict(torch.load("saved_models/%s/EC_B_%d.pth" % (opt.dataset_name, opt.epoch)))
+    G_A.load_state_dict(torch.load("saved_models/%s/G_A_%d.pth" % (opt.dataset_name, opt.epoch)))
+    G_B.load_state_dict(torch.load("saved_models/%s/G_B_%d.pth" % (opt.dataset_name, opt.epoch)))
     D_A.load_state_dict(torch.load("saved_models/%s/D_A_%d.pth" % (opt.dataset_name, opt.epoch)))
     D_B.load_state_dict(torch.load("saved_models/%s/D_B_%d.pth" % (opt.dataset_name, opt.epoch)))
+    D_S.load_state_dict(torch.load("saved_models/%s/D_S_%d.pth" % (opt.dataset_name, opt.epoch)))
 else:
     # Initialize weights
-    G_AB.apply(weights_init_normal)
-    G_BA.apply(weights_init_normal)
+    EC_A.apply(weights_init_normal)
+    EC_B.apply(weights_init_normal)
+    ES_A.apply(weights_init_normal)
+    ES_B.apply(weights_init_normal)
+    G_A.apply(weights_init_normal)
+    G_B.apply(weights_init_normal)
     D_A.apply(weights_init_normal)
     D_B.apply(weights_init_normal)
+    D_S.apply(weights_init_normal)
 
 # Optimizers
-optimizer_G = torch.optim.Adam(
-    itertools.chain(G_AB.parameters(), G_BA.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
+optimizer_EG = torch.optim.Adam(
+    itertools.chain(EC_A.parameters(), ES_A.parameters(), G_A.parameters(), 
+                    EC_B.parameters(), ES_A.parameters(), G_B.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
 )
 optimizer_D_A = torch.optim.Adam(D_A.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D_B = torch.optim.Adam(D_B.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
 # Learning rate update schedulers
-lr_scheduler_G = torch.optim.lr_scheduler.LambdaLR(
-    optimizer_G, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
+lr_scheduler_EG = torch.optim.lr_scheduler.LambdaLR(
+    optimizer_EG, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
 )
 lr_scheduler_D_A = torch.optim.lr_scheduler.LambdaLR(
     optimizer_D_A, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
@@ -102,7 +121,9 @@ lr_scheduler_D_B = torch.optim.lr_scheduler.LambdaLR(
     optimizer_D_B, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
 )
 
-Tensor = torch.cuda.FloatTensor if cuda else torch.Tensor
+Tensor = torch.Tensor
+if cuda:
+    Tensor = torch.cuda.FloatTensor
 
 # Buffers of previously generated samples
 fake_A_buffer = ReplayBuffer()
@@ -136,12 +157,21 @@ val_dataloader = DataLoader(
 def sample_images(batches_done):
     """Saves a generated sample from the test set"""
     imgs = next(iter(val_dataloader))
-    G_AB.eval()
-    G_BA.eval()
+    EC_A.eval()
+    ES_A.eval()
+    EC_B.eval()
+    ES_B.eval()
+
     real_A = Variable(imgs["A"].type(Tensor))
-    fake_B = G_AB(real_A)
     real_B = Variable(imgs["B"].type(Tensor))
-    fake_A = G_BA(real_B)
+
+    C_A = EC_A(real_A)
+    S_A = ES_A(real_A)
+    C_B = EC_B(real_B)
+    S_B = ES_B(real_B)
+
+    fake_A = G_A(C_B, S_A)
+    fake_B = G_B(C_A, S_B)
     # Arange images along x-axis
     real_A = make_grid(real_A, nrow=5, normalize=True)
     real_B = make_grid(real_B, nrow=5, normalize=True)
@@ -173,29 +203,41 @@ def main():
             #  Train Generators
             # ------------------
 
-            G_AB.train()
-            G_BA.train()
+            EC_A.train()
+            ES_A.train()
+            EC_B.train()
+            ES_B.train()
 
-            optimizer_G.zero_grad()
+            optimizer_EG.zero_grad()
+
+            ccode_a = EC_A(real_A)
+            scode_a = ES_A(real_A)
+            ccode_b = EC_B(real_B)
+            scode_b = ES_B(real_B)
 
             # Identity loss
-            loss_id_A = criterion_identity(G_BA(real_A), real_A)
-            loss_id_B = criterion_identity(G_AB(real_B), real_B)
+            loss_id_A = criterion_identity(G_A(ccode_a, scode_a), real_A)
+            loss_id_B = criterion_identity(G_B(ccode_b, scode_b), real_B)
 
             loss_identity = (loss_id_A + loss_id_B) / 2
 
             # GAN loss
-            fake_B = G_AB(real_A)
-            loss_GAN_AB = criterion_GAN(D_B(fake_B), valid)
-            fake_A = G_BA(real_B)
-            loss_GAN_BA = criterion_GAN(D_A(fake_A), valid)
+            fake_A = G_A(ccode_b, scode_a)
+            fake_B = G_B(ccode_a, scode_b)
+            loss_GAN_A = criterion_GAN(D_A(fake_A), valid)
+            loss_GAN_B = criterion_GAN(D_B(fake_B), valid)
 
-            loss_GAN = (loss_GAN_AB + loss_GAN_BA) / 2
+            loss_GAN = (loss_GAN_A + loss_GAN_B) / 2
 
             # Cycle loss
-            recov_A = G_BA(fake_B)
+            f_ccode_a = EC_A(fake_A)
+            f_scode_a = ES_A(fake_A)
+            f_ccode_b = EC_B(fake_B)
+            f_scode_b = ES_B(fake_B)
+            recov_A = G_A(f_ccode_b, f_scode_a)
+            recov_B = G_B(f_ccode_a, f_scode_b)
+
             loss_cycle_A = criterion_cycle(recov_A, real_A)
-            recov_B = G_AB(fake_A)
             loss_cycle_B = criterion_cycle(recov_B, real_B)
 
             loss_cycle = (loss_cycle_A + loss_cycle_B) / 2
@@ -204,7 +246,7 @@ def main():
             loss_G = loss_GAN + opt.lambda_cyc * loss_cycle + opt.lambda_id * loss_identity
 
             loss_G.backward()
-            optimizer_G.step()
+            optimizer_EG.step()
 
             # -----------------------
             #  Train Discriminator A
@@ -274,16 +316,21 @@ def main():
                 sample_images(batches_done)
 
         # Update learning rates
-        lr_scheduler_G.step()
+        lr_scheduler_EG.step()
         lr_scheduler_D_A.step()
         lr_scheduler_D_B.step()
 
         if opt.checkpoint_interval != -1 and epoch % opt.checkpoint_interval == 0:
             # Save model checkpoints
-            torch.save(G_AB.state_dict(), "saved_models/%s/G_AB_%d.pth" % (opt.dataset_name, epoch))
-            torch.save(G_BA.state_dict(), "saved_models/%s/G_BA_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(EC_A.state_dict(), "saved_models/%s/EC_A_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(ES_A.state_dict(), "saved_models/%s/ES_A_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(EC_B.state_dict(), "saved_models/%s/EC_B_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(ES_B.state_dict(), "saved_models/%s/ES_B_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(G_A.state_dict(), "saved_models/%s/G_A_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(G_B.state_dict(), "saved_models/%s/G_B_%d.pth" % (opt.dataset_name, epoch))
             torch.save(D_A.state_dict(), "saved_models/%s/D_A_%d.pth" % (opt.dataset_name, epoch))
             torch.save(D_B.state_dict(), "saved_models/%s/D_B_%d.pth" % (opt.dataset_name, epoch))
+            torch.save(D_S.state_dict(), "saved_models/%s/D_S_%d.pth" % (opt.dataset_name, epoch))
 
 if __name__ == "__main__":
     main()

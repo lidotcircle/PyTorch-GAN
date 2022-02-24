@@ -1,6 +1,7 @@
+from typing import List
 import torch.nn as nn
-import torch.nn.functional as F
 import torch
+import utils
 
 
 def weights_init_normal(m):
@@ -40,54 +41,104 @@ class ResidualBlock(nn.Module):
         return x + self.block(x)
 
 
-class GeneratorResNet(nn.Module):
-    def __init__(self, input_shape, num_residual_blocks):
-        super(GeneratorResNet, self).__init__()
+###################################
+#        Encoder-Decoder
+###################################
+
+
+class EncoderResNet(nn.Module):
+    def __init__(self, input_shape, output_dimensions, num_residual_blocks):
+        super(EncoderResNet, self).__init__()
+        assert len(input_shape) == 3
 
         channels = input_shape[0]
+        height = input_shape[1]
+        width = input_shape[2]
 
         # Initial convolution block
         out_features = 64
         model = [
-            nn.ReflectionPad2d(channels),
+            nn.ReflectionPad2d(3),
             nn.Conv2d(channels, out_features, 7),
             nn.InstanceNorm2d(out_features),
             nn.ReLU(inplace=True),
         ]
         in_features = out_features
+        height += 6
+        width += 6
+        height, width = utils.output_shape_of_conv2d(model[1], (height, width))
 
         # Downsampling
         for _ in range(2):
             out_features *= 2
+            padding = 1
             model += [
-                nn.Conv2d(in_features, out_features, 3, stride=2, padding=1),
+                nn.Conv2d(in_features, out_features, 3, stride=2, padding=padding),
                 nn.InstanceNorm2d(out_features),
                 nn.ReLU(inplace=True),
             ]
             in_features = out_features
+            height, width = utils.output_shape_of_conv2d(model[-3], (height, width))
 
         # Residual blocks
         for _ in range(num_residual_blocks):
             model += [ResidualBlock(out_features)]
 
-        # Upsampling
-        for _ in range(2):
-            out_features //= 2
-            model += [
-                nn.Upsample(scale_factor=2),
-                nn.Conv2d(in_features, out_features, 3, stride=1, padding=1),
-                nn.InstanceNorm2d(out_features),
-                nn.ReLU(inplace=True),
-            ]
-            in_features = out_features
-
-        # Output layer
-        model += [nn.ReflectionPad2d(channels), nn.Conv2d(out_features, channels, 7), nn.Tanh()]
-
         self.model = nn.Sequential(*model)
+        self.conv_out_dimensions = out_features * height * width
+        self.linear_out = nn.Linear(self.conv_out_dimensions, output_dimensions)
 
     def forward(self, x):
-        return self.model(x)
+        val = self.model(x)
+        val = val.reshape(val.shape[0], self.conv_out_dimensions)
+        return self.linear_out(val)
+
+
+class DecoderResNet(nn.Module):
+    def __init__(self, input_dimension, output_shape, num_residual_blocks):
+        super(DecoderResNet, self).__init__()
+
+        assert len(output_shape) == 3
+        out_channels = output_shape[0]
+        out_height = output_shape[1]
+        out_width = output_shape[2]
+
+        out_features = 64
+        model: List[nn.Module] = []
+        model = [nn.ReflectionPad2d(3), nn.Conv2d(out_features, out_channels, 7), nn.Tanh()]
+
+        # Upsampling
+        for _ in range(2):
+            in_features = out_features * 2
+            conv_layer = nn.Conv2d(in_features, out_features, 3, stride=1, padding=1)
+            model = [
+                nn.Upsample(scale_factor=2),
+                conv_layer,
+                nn.InstanceNorm2d(out_features),
+                nn.ReLU(inplace=True),
+            ] + model
+            out_features = in_features
+            out_height, out_width = utils.lb_input_shape_of_conv2d(conv_layer, (out_height, out_width))
+            assert out_height % 2 == 0 and out_width % 2 == 0
+            out_height //= 2
+            out_width //= 2
+
+        # Residual blocks
+        for _ in range(num_residual_blocks):
+            resblock: nn.Module = ResidualBlock(out_features)
+            model.insert(0, resblock)
+
+        # Output layer
+        self.model = nn.Sequential(*model)
+
+        assert input_dimension % out_features == 0
+        self.linear_in = nn.Linear(input_dimension, out_features * out_height * out_width)
+        self.linear_in_reshape = (out_features, out_height, out_width)
+
+    def forward(self, x):
+        val = self.linear_in(x)
+        val.reshape(val.shape[0], *self.linear_in_reshape)
+        return self.model(val)
 
 
 ##############################
@@ -106,7 +157,7 @@ class Discriminator(nn.Module):
 
         def discriminator_block(in_filters, out_filters, normalize=True):
             """Returns downsampling layers of each discriminator block"""
-            layers = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            layers: List[ nn.Module ] = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
             if normalize:
                 layers.append(nn.InstanceNorm2d(out_filters))
             layers.append(nn.LeakyReLU(0.2, inplace=True))
@@ -123,3 +174,22 @@ class Discriminator(nn.Module):
 
     def forward(self, img):
         return self.model(img)
+
+
+class ContentCodeDiscriminator(nn.Module):
+    def __init__(self, codo_dim: int) -> None:
+        super(ContentCodeDiscriminator, self).__init__()
+        self.code_dim = codo_dim
+
+        self.model = nn.Sequential(
+            nn.Linear(self.code_dim, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 512),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Linear(512, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, stylecode):
+        return self.model(stylecode)
+
