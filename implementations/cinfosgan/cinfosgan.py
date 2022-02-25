@@ -55,15 +55,16 @@ cuda = torch.cuda.is_available()
 input_shape = (opt.channels, opt.img_height, opt.img_width)
 
 # Initialize generator and discriminator
-EC_A = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
-EC_B = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
-ES_A = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
-ES_B = EncoderResNet(input_shape, 256 * 256, opt.n_residual_blocks)
-G_A = DecoderResNet(256 * 256 * 2, input_shape, opt.n_residual_blocks)
-G_B = DecoderResNet(256 * 256 * 2, input_shape, opt.n_residual_blocks)
+EC_A = EncoderResNet(input_shape, opt.n_residual_blocks)
+EC_B = EncoderResNet(input_shape, opt.n_residual_blocks)
+ES_A = EncoderResNet(input_shape, opt.n_residual_blocks)
+ES_B = EncoderResNet(input_shape, opt.n_residual_blocks)
+channels, height, width = EC_A.output_shape
+G_A = DecoderResNet((channels * 2, height, width), input_shape, opt.n_residual_blocks)
+G_B = DecoderResNet((channels * 2, height, width), input_shape, opt.n_residual_blocks)
 D_A = Discriminator(input_shape)
 D_B = Discriminator(input_shape)
-D_S = ContentCodeDiscriminator(256 * 256)
+D_S = ContentCodeDiscriminator((channels, height, width))
 
 if cuda:
     EC_A = EC_A.cuda()
@@ -105,7 +106,7 @@ else:
 # Optimizers
 optimizer_EG = torch.optim.Adam(
     itertools.chain(EC_A.parameters(), ES_A.parameters(), G_A.parameters(), 
-                    EC_B.parameters(), ES_A.parameters(), G_B.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
+                    EC_B.parameters(), ES_B.parameters(), G_B.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
 )
 optimizer_D_A = torch.optim.Adam(D_A.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_D_B = torch.optim.Adam(D_B.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))

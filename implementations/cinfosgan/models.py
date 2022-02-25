@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Tuple
 import torch.nn as nn
 import torch
 import utils
@@ -47,7 +47,7 @@ class ResidualBlock(nn.Module):
 
 
 class EncoderResNet(nn.Module):
-    def __init__(self, input_shape, output_dimensions, num_residual_blocks):
+    def __init__(self, input_shape, num_residual_blocks):
         super(EncoderResNet, self).__init__()
         assert len(input_shape) == 3
 
@@ -85,17 +85,14 @@ class EncoderResNet(nn.Module):
             model += [ResidualBlock(out_features)]
 
         self.model = nn.Sequential(*model)
-        self.conv_out_dimensions = out_features * height * width
-        self.linear_out = nn.Linear(self.conv_out_dimensions, output_dimensions)
+        self.output_shape = (out_features, height, width)
 
     def forward(self, x):
-        val = self.model(x)
-        val = val.reshape(val.shape[0], self.conv_out_dimensions)
-        return self.linear_out(val)
+        return self.model(x)
 
 
 class DecoderResNet(nn.Module):
-    def __init__(self, input_dimension, output_shape, num_residual_blocks):
+    def __init__(self, input_shape, output_shape, num_residual_blocks):
         super(DecoderResNet, self).__init__()
 
         assert len(output_shape) == 3
@@ -128,17 +125,28 @@ class DecoderResNet(nn.Module):
             resblock: nn.Module = ResidualBlock(out_features)
             model.insert(0, resblock)
 
+        assert len(input_shape) == 3
+        assert input_shape[1] - out_height == input_shape[2] - out_width
+        kernel_size = input_shape[1] - out_height + 1
+        padding = 0
+        if (kernel_size < 3):
+            padding = 3 - kernel_size
+            kernel_size = 3
+
+        assert kernel_size <= 7
+        model = [
+            nn.Conv2d(input_shape[0], out_features, kernel_size, stride = 1, padding=padding),
+            nn.ReLU(),
+        ] + model
+
         # Output layer
         self.model = nn.Sequential(*model)
 
-        assert input_dimension % out_features == 0
-        self.linear_in = nn.Linear(input_dimension, out_features * out_height * out_width)
-        self.linear_in_reshape = (out_features, out_height, out_width)
 
-    def forward(self, x):
-        val = self.linear_in(x)
-        val.reshape(val.shape[0], *self.linear_in_reshape)
-        return self.model(val)
+    def forward(self, content: torch.Tensor, style: torch.Tensor):
+        assert len(style.shape) == len(content.shape) == 4
+        ints = torch.cat((style, content), dim = 1)
+        return self.model(ints)
 
 
 ##############################
@@ -177,19 +185,26 @@ class Discriminator(nn.Module):
 
 
 class ContentCodeDiscriminator(nn.Module):
-    def __init__(self, codo_dim: int) -> None:
+    def __init__(self, input_shape: Tuple[int,int,int]) -> None:
         super(ContentCodeDiscriminator, self).__init__()
-        self.code_dim = codo_dim
+
+        channels, height, width = input_shape
+        self.output_shape = (1, height // 2 ** 2, width // 2 ** 2)
+
+        def discriminator_block(in_filters, out_filters, normalize=True):
+            """Returns downsampling layers of each discriminator block"""
+            layers: List[ nn.Module ] = [nn.Conv2d(in_filters, out_filters, 4, stride=2, padding=1)]
+            if normalize:
+                layers.append(nn.InstanceNorm2d(out_filters))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
 
         self.model = nn.Sequential(
-            nn.Linear(self.code_dim, 512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(512, 512),
-            nn.LeakyReLU(0.2, inplace=True),
-            nn.Linear(512, 1),
-            nn.Sigmoid(),
+            *discriminator_block(channels * 1, channels * 2, normalize=False),
+            *discriminator_block(channels * 2, channels * 4),
+            nn.ZeroPad2d((1, 0, 1, 0)),
+            nn.Conv2d(channels * 4, 1, 4, padding=1)
         )
 
-    def forward(self, stylecode):
-        return self.model(stylecode)
-
+    def forward(self, input):
+        return self.model(input)
