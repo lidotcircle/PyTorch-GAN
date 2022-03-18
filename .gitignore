@@ -4,7 +4,7 @@
 *.hdf5
 .DS_Store
 
-data/*/
+data/*
 implementations/*/data
 implementations/*/images
 implementations/*/saved_models

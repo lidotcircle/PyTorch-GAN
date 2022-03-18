@@ -96,6 +96,7 @@ class DomainDecoder(nn.Module):
             nn.InstanceNorm2d(out_features),
             nn.ReLU(inplace=True),
         ]
+        in_features = out_features
 
         for _ in range(4):
             out_features //= 2
@@ -116,6 +117,9 @@ class DomainDecoder(nn.Module):
             nn.Tanh()
         ]
         self.model = nn.Sequential(*model)
+
+    def forward(self, x: torch.Tensor):
+        return self.model(x)
 
 
 ##############################

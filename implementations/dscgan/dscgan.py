@@ -4,6 +4,7 @@ import numpy as np
 import itertools
 import datetime
 import time
+import signal
 
 
 import torchvision.transforms as transforms
@@ -36,8 +37,8 @@ parser.add_argument("--channels",            type=int,   default=3,             
 parser.add_argument("--sample_interval",     type=int,   default=100,           help="interval between saving generator outputs")
 parser.add_argument("--checkpoint_interval", type=int,   default=1,             help="interval between saving model checkpoints")
 parser.add_argument("--n_residual_blocks",   type=int,   default=2,             help="number of residual blocks in generator")
-parser.add_argument("--lambda_ace_id",       type=float, default=1,             help="autoencoder identity loss weight")
-parser.add_argument("--lambda_ace_gan",      type=float, default=1,             help="autoencoder GAN loss weight")
+parser.add_argument("--lambda_ae_id",       type=float, default=10,            help="autoencoder identity loss weight")
+parser.add_argument("--lambda_ae_gan",      type=float, default=1,             help="autoencoder GAN loss weight")
 opt = parser.parse_args()
 print(opt)
 
@@ -61,7 +62,7 @@ DomainEncoder_B = DomainEncoder(3, 2)
 DomainDecoder_B = DomainDecoder(DomainEncoder_B.out_features, 2)
 DomainDiscriminator_A = DomainDiscriminator((3, opt.img_height, opt.img_width))
 DomainDiscriminator_B = DomainDiscriminator((3, opt.img_height, opt.img_width))
-models = [ 
+model_components = [ 
         [ DomainEncoder_A, "DomainEncoder_A" ],
         [ DomainDecoder_A, "DomainDecoder_A" ],
         [ DomainEncoder_B, "DomainEncoder_B" ],
@@ -71,16 +72,34 @@ models = [
         ]
 
 if cuda:
-    map(lambda model: model[0].cuda(), models)
+    for model in model_components:
+        model[0].cuda()
 
-if opt.epoch != 0:
-    map(lambda model: model[0].load_state_dict(torch.load("saved_models/%s/%s_%d.pth" % (opt.dataset_name, model[1], opt.epoch))), models)
-else:
-    map(lambda model: model[0].apply(weights_init_normal), models)
+for model in model_components:
+    model_filename = "saved_models/%s/%s_%d.pth" % (opt.dataset_name, model[1], opt.epoch)
+    be_load = False
+    be_init = False
+    if os.path.exists(model_filename):
+        if __name__ == "__main__":
+            print("loading model %s" % (model_filename))
+        model[0].load_state_dict(torch.load(model_filename))
+        be_load = True
+    else:
+        model[0].apply(weights_init_normal)
+        be_init = True
+    if be_load and be_init:
+        print("Inconsistent model, some parts were loaded from previous saved, some not")
 
 def save_models(epoch):
-    for model in models:
+    for model in model_components:
         torch.save(model[0].state_dict(), "saved_models/%s/%s_%d.pth" % (opt.dataset_name, model[1], epoch))
+    
+def clear_gradient():
+    for model in model_components:
+        for p in model[0].parameters():
+            if p.grad is not None:
+                del p.grad
+    torch.cuda.empty_cache()
 
 # Optimizers
 optimizer_DomainA = torch.optim.Adam(
@@ -163,13 +182,26 @@ def sample_images(batches_done):
     save_image(image_grid, "images/%s/%s.png" % (opt.dataset_name, batches_done), normalize=False)
 
 
+saved_epoch = 0
+is_training_process = False
+def interrupt_exit(signum, frame):
+    if not is_training_process:
+        sys.exit(1)
+    print("saving models...")
+    save_models(saved_epoch)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, interrupt_exit)
+
 # ----------
 #  Training
 # ----------
-
 def main():
+    global saved_epoch, is_training_process
+    is_training_process = True
     prev_time = time.time()
     for epoch in range(opt.epoch, opt.n_epochs):
+        saved_epoch = epoch
         for i, batch in enumerate(dataloader):
             optimizer_DomainA.zero_grad()
             optimizer_DomainB.zero_grad()
@@ -208,8 +240,8 @@ def main():
             loss_GAN_A = criterion_GAN(DomainDiscriminator_A(fake_A), valid)
             loss_GAN_B = criterion_GAN(DomainDiscriminator_B(fake_B), valid)
 
-            loss_domain_A = loss_GAN_A * opt.lambda_ace_gan + loss_aec_id_A * opt.lambda_ace_id
-            loss_domain_B = loss_GAN_B * opt.lambda_ace_gan + loss_aec_id_B * opt.lambda_ace_id
+            loss_domain_A = loss_GAN_A * opt.lambda_ae_gan + loss_aec_id_A * opt.lambda_ae_id
+            loss_domain_B = loss_GAN_B * opt.lambda_ae_gan + loss_aec_id_B * opt.lambda_ae_id
 
             loss_domain_A.backward()
             loss_domain_B.backward()
@@ -280,5 +312,15 @@ def main():
             # Save model checkpoints
             save_models(epoch)
 
+
 if __name__ == "__main__":
-    main()
+    while True:
+        try:
+            main()
+        except RuntimeError as e:
+            if 'out of meomory' in str(e):
+                print("|Warning: out of memory")
+                clear_gradient()
+                torch.cuda.empty_cache()
+            else:
+                raise e 
