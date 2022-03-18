@@ -25,10 +25,10 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--epoch",               type=int,   default=0,             help="epoch to start training from")
 parser.add_argument("--n_epochs",            type=int,   default=200,           help="number of epochs of training")
 parser.add_argument("--dataset_name",        type=str,   default="monet2photo", help="name of the dataset")
-parser.add_argument("--batch_size",          type=int,   default=1,             help="size of the batches")
+parser.add_argument("--batch_size",          type=int,   default=3,             help="size of the batches")
 parser.add_argument("--lr",                  type=float, default=0.0002,        help="adam: learning rate")
 parser.add_argument("--b1",                  type=float, default=0.5,           help="adam: decay of first order momentum of gradient")
-parser.add_argument("--b2",                  type=float, default=0.999,         help="adam: decay of first order momentum of gradient")
+parser.add_argument("--b2",                  type=float, default=0.999,         help="adam: decay of second order momentum of gradient")
 parser.add_argument("--decay_epoch",         type=int,   default=100,           help="epoch from which to start lr decay")
 parser.add_argument("--n_cpu",               type=int,   default=2,             help="number of cpu threads to use during batch generation")
 parser.add_argument("--img_height",          type=int,   default=256,           help="size of image height")
@@ -182,7 +182,7 @@ def sample_images(batches_done):
     save_image(image_grid, "images/%s/%s.png" % (opt.dataset_name, batches_done), normalize=False)
 
 
-saved_epoch = 0
+saved_epoch = opt.epoch
 is_training_process = False
 def interrupt_exit(signum, frame):
     if not is_training_process:
@@ -199,8 +199,9 @@ signal.signal(signal.SIGINT, interrupt_exit)
 def main():
     global saved_epoch, is_training_process
     is_training_process = True
+    epoch_start = saved_epoch
     prev_time = time.time()
-    for epoch in range(opt.epoch, opt.n_epochs):
+    for epoch in range(epoch_start, opt.n_epochs):
         saved_epoch = epoch
         for i, batch in enumerate(dataloader):
             optimizer_DomainA.zero_grad()

@@ -48,7 +48,7 @@ class DomainEncoder(nn.Module):
     def __init__(self, input_channels: int, n_residual_blocks: int):
         super(DomainEncoder, self).__init__()
 
-        out_features = 64
+        out_features = 32
         model = [
             nn.ReflectionPad2d(3),
             nn.Conv2d(input_channels, out_features, kernel_size=7),
@@ -89,7 +89,7 @@ class DomainDecoder(nn.Module):
     def __init__(self, in_features: int, n_residual_blocks: int):
         super(DomainDecoder, self).__init__()
 
-        out_features = in_features * 8
+        out_features = in_features * 16
         model = [
             nn.ReflectionPad2d(3),
             nn.Conv2d(in_features, out_features, kernel_size=7),
