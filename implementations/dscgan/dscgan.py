@@ -318,7 +318,7 @@ if __name__ == "__main__":
         try:
             main()
         except RuntimeError as e:
-            if 'out of meomory' in str(e):
+            if 'out of memory' in str(e):
                 print("|Warning: out of memory")
                 clear_gradient()
                 torch.cuda.empty_cache()
