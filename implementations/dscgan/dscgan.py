@@ -236,10 +236,6 @@ def main():
     for epoch in range(epoch_start, opt.n_epochs):
         saved_epoch = epoch
         for i, batch in enumerate(dataloader):
-            optimizer_MainModel.zero_grad()
-            optimizer_DomainA_Dis.zero_grad()
-            optimizer_DomainB_Dis.zero_grad()
-
             # Set model input
             real_A = Variable(batch["A"].type(Tensor))
             real_B = Variable(batch["B"].type(Tensor))
@@ -252,6 +248,7 @@ def main():
             # ------------------
             #  Train MainModel
             # ------------------
+            optimizer_MainModel.zero_grad()
             DomainEncoder_A.train()
             DomainDecoder_A.train()
             DomainStyleExtractor_A.train()
@@ -344,6 +341,7 @@ def main():
             # -----------------------
             #  Train Discriminator A
             # -----------------------
+            optimizer_DomainA_Dis.zero_grad()
             DomainDiscriminator_A.train()
             loss_real = criterion_GAN(DomainDiscriminator_A(real_A), valid)
             fake_A_ = fake_A_buffer.push_and_pop(fake_A)
@@ -357,6 +355,7 @@ def main():
             # -----------------------
             #  Train Discriminator B
             # -----------------------
+            optimizer_DomainB_Dis.zero_grad()
             DomainDiscriminator_B.train()
             loss_real = criterion_GAN(DomainDiscriminator_B(real_B), valid)
             fake_B_ = fake_A_buffer.push_and_pop(fake_B)
