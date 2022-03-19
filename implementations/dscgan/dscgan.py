@@ -14,7 +14,8 @@ from torchvision.utils import save_image, make_grid
 from torch.utils.data import DataLoader
 from torch.autograd import Variable
 
-from models import DomainEncoder, DomainDecoder, DomainDiscriminator, weights_init_normal
+from models import DomainEncoder, DomainDecoder, DomainDiscriminator
+from models import DomainStyleExtractor, ContentExtractor, DomainImageGenerator, weights_init_normal
 from datasets import ImageDataset
 from utils import ReplayBuffer, LambdaLR
 
@@ -37,8 +38,12 @@ parser.add_argument("--channels",            type=int,   default=3,             
 parser.add_argument("--sample_interval",     type=int,   default=100,           help="interval between saving generator outputs")
 parser.add_argument("--checkpoint_interval", type=int,   default=1,             help="interval between saving model checkpoints")
 parser.add_argument("--n_residual_blocks",   type=int,   default=2,             help="number of residual blocks in generator")
-parser.add_argument("--lambda_ae_id",       type=float, default=10,            help="autoencoder identity loss weight")
-parser.add_argument("--lambda_ae_gan",      type=float, default=1,             help="autoencoder GAN loss weight")
+parser.add_argument("--lambda_ae",           type=float, default=5,             help="autoencoder identity loss weight")
+parser.add_argument("--lambda_self",         type=float, default=5,             help="image self reconstruction loss weight")
+parser.add_argument("--lambda_cycle",        type=float, default=5,             help="image cycle consistency loss weight")
+parser.add_argument("--lambda_style",        type=float, default=5,             help="style cycle consistency loss weight")
+parser.add_argument("--lambda_kld",          type=float, default=5,             help="style code KL divergence loss weight")
+parser.add_argument("--lambda_gan",          type=float, default=5,             help="GAN loss weight")
 opt = parser.parse_args()
 print(opt)
 
@@ -60,6 +65,11 @@ DomainEncoder_A = DomainEncoder(3, 2)
 DomainDecoder_A = DomainDecoder(DomainEncoder_A.out_features, 2)
 DomainEncoder_B = DomainEncoder(3, 2)
 DomainDecoder_B = DomainDecoder(DomainEncoder_B.out_features, 2)
+DomainStyleExtractor_A = DomainStyleExtractor((64, 32, 32), output_channels= 8, heads = 4, expansion = 2, dropout = 0.1, layers=4)
+DomainStyleExtractor_B = DomainStyleExtractor((64, 32, 32), output_channels= 8, heads = 4, expansion = 2, dropout = 0.1, layers=4)
+ImageContentExtractor = ContentExtractor((64,32,32), heads = 4, expansion = 2, dropout = 0.1, layers=4)
+DomainImageGenerator_A = DomainImageGenerator(8, 64, 2)
+DomainImageGenerator_B = DomainImageGenerator(8, 64, 2)
 DomainDiscriminator_A = DomainDiscriminator((3, opt.img_height, opt.img_width))
 DomainDiscriminator_B = DomainDiscriminator((3, opt.img_height, opt.img_width))
 model_components = [ 
@@ -67,6 +77,11 @@ model_components = [
         [ DomainDecoder_A, "DomainDecoder_A" ],
         [ DomainEncoder_B, "DomainEncoder_B" ],
         [ DomainDecoder_B, "DomainDecoder_B" ],
+        [ DomainStyleExtractor_A, "DomainStyleExtractor_A" ],
+        [ DomainStyleExtractor_B, "DomainStyleExtractor_B" ],
+        [ ImageContentExtractor,  "ImageContentExtractor" ],
+        [ DomainImageGenerator_A, "DomainImageGenerator_A" ],
+        [ DomainImageGenerator_B, "DomainImageGenerator_B" ],
         [ DomainDiscriminator_A, "DomainDiscriminator_A" ],
         [ DomainDiscriminator_B, "DomainDiscriminator_B" ],
         ]
@@ -102,21 +117,18 @@ def clear_gradient():
     torch.cuda.empty_cache()
 
 # Optimizers
-optimizer_DomainA = torch.optim.Adam(
-    itertools.chain(DomainEncoder_A.parameters(), DomainDecoder_A.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
-)
-optimizer_DomainB = torch.optim.Adam(
-    itertools.chain(DomainEncoder_B.parameters(), DomainDecoder_B.parameters()), lr=opt.lr, betas=(opt.b1, opt.b2)
+optimizer_MainModel = torch.optim.Adam(
+    itertools.chain(DomainEncoder_A.parameters(), DomainDecoder_A.parameters(),
+                    DomainStyleExtractor_A.parameters(), DomainImageGenerator_A.parameters(),
+                    DomainEncoder_B.parameters(), DomainDecoder_B.parameters(),
+                    DomainStyleExtractor_B.parameters(), DomainImageGenerator_B.parameters(),), lr=opt.lr, betas=(opt.b1, opt.b2)
 )
 optimizer_DomainA_Dis = torch.optim.Adam(DomainDiscriminator_A.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 optimizer_DomainB_Dis = torch.optim.Adam(DomainDiscriminator_B.parameters(), lr=opt.lr, betas=(opt.b1, opt.b2))
 
 # Learning rate update schedulers
-lr_scheduler_DomainA= torch.optim.lr_scheduler.LambdaLR(
-    optimizer_DomainA, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
-)
-lr_scheduler_DomainB= torch.optim.lr_scheduler.LambdaLR(
-    optimizer_DomainB, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
+lr_scheduler_MainModel= torch.optim.lr_scheduler.LambdaLR(
+    optimizer_MainModel, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
 )
 lr_scheduler_DomainA_Dis = torch.optim.lr_scheduler.LambdaLR(
     optimizer_DomainA_Dis, lr_lambda=LambdaLR(opt.n_epochs, opt.epoch, opt.decay_epoch).step
@@ -193,6 +205,26 @@ def interrupt_exit(signum, frame):
 
 signal.signal(signal.SIGINT, interrupt_exit)
 
+
+def gaussian_reparameterize_sample(mu: Tensor, logvar: Tensor) -> Tensor:
+    """
+    :param mu: (Tensor) Mean of the latent Gaussian
+    :param logvar: (Tensor) Standard deviation of the latent Gaussian
+    :return:
+    """
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return eps * std + mu
+
+def image_gaussian_reparameterize_sample(mu: Tensor, logvar: Tensor) -> Tensor:
+    assert len(mu.shape) == 4 and len(logvar.shape) == 4
+    bs, c, h, w = mu.shape
+    mu = mu.view(bs, c * h * w)
+    logvar = logvar.view(bs, c * h * w)
+    val = gaussian_reparameterize_sample(mu, logvar)
+    val = val.view(bs, c, h, w)
+    return val
+
 # ----------
 #  Training
 # ----------
@@ -204,8 +236,7 @@ def main():
     for epoch in range(epoch_start, opt.n_epochs):
         saved_epoch = epoch
         for i, batch in enumerate(dataloader):
-            optimizer_DomainA.zero_grad()
-            optimizer_DomainB.zero_grad()
+            optimizer_MainModel.zero_grad()
             optimizer_DomainA_Dis.zero_grad()
             optimizer_DomainB_Dis.zero_grad()
 
@@ -216,38 +247,98 @@ def main():
             # Adversarial ground truths
             valid = Variable(Tensor(np.ones((real_A.size(0), *DomainDiscriminator_A.output_shape))), requires_grad=False)
             fake = Variable(Tensor(np.zeros((real_A.size(0), *DomainDiscriminator_A.output_shape))), requires_grad=False)
+            log_statistics = {}
 
             # ------------------
-            #  Train Auto-Encoder
+            #  Train MainModel
             # ------------------
             DomainEncoder_A.train()
             DomainDecoder_A.train()
+            DomainStyleExtractor_A.train()
+            DomainImageGenerator_A.train()
             DomainEncoder_B.train()
             DomainDecoder_B.train()
-
-            optimizer_DomainA.zero_grad()
-            optimizer_DomainB.zero_grad()
+            DomainStyleExtractor_B.train()
+            DomainImageGenerator_B.train()
+            ImageContentExtractor.train()
 
             interm_a = DomainEncoder_A(real_A)
             interm_b = DomainEncoder_B(real_B)
             fake_A   = DomainDecoder_A(interm_a)
             fake_B   = DomainDecoder_B(interm_b)
 
-            # Identity loss
-            loss_aec_id_A = criterion_identity(fake_A, real_A)
-            loss_aec_id_B = criterion_identity(fake_B, real_B)
+            # Autoencoder Identity loss
+            loss_ae_id_A = criterion_identity(fake_A, real_A)
+            loss_ae_id_B = criterion_identity(fake_B, real_B)
+            log_statistics["AE Identity Loss"] = loss_ae_id_A.item() + loss_ae_id_B.item()
 
-            # GAN loss
-            loss_GAN_A = criterion_GAN(DomainDiscriminator_A(fake_A), valid)
-            loss_GAN_B = criterion_GAN(DomainDiscriminator_B(fake_B), valid)
+            # Autoencoder GAN loss
+            loss_ae_adv_A = criterion_GAN(DomainDiscriminator_A(fake_A), valid)
+            loss_ae_adv_B = criterion_GAN(DomainDiscriminator_B(fake_B), valid)
+            log_statistics["AE GAN Loss"] = loss_ae_adv_A.mean().item() + loss_ae_adv_B.mean().item()
 
-            loss_domain_A = loss_GAN_A * opt.lambda_ae_gan + loss_aec_id_A * opt.lambda_ae_id
-            loss_domain_B = loss_GAN_B * opt.lambda_ae_gan + loss_aec_id_B * opt.lambda_ae_id
+            # Self-Translation loss
+            style_code_a_mu, style_code_a_logvar = DomainStyleExtractor_A(interm_a)
+            style_code_b_mu, style_code_b_logvar = DomainStyleExtractor_B(interm_b)
+            loss_kld_a = -0.5 * torch.sum(-style_code_a_logvar.exp() - torch.pow(style_code_a_mu,2) + style_code_a_logvar + 1, dim = (1,2,3))
+            loss_kld_b = -0.5 * torch.sum(-style_code_b_logvar.exp() - torch.pow(style_code_b_mu,2) + style_code_b_logvar + 1, dim = (1,2,3))
+            log_statistics["KLDiv"] = loss_kld_a.mean().item() + loss_kld_b.mean().item()
+            style_code_a = image_gaussian_reparameterize_sample(style_code_a_mu, style_code_a_logvar)
+            style_code_b = image_gaussian_reparameterize_sample(style_code_b_mu, style_code_b_logvar)
+            content_a = ImageContentExtractor(interm_a)
+            content_b = ImageContentExtractor(interm_b)
+            self_gen_a = DomainImageGenerator_A(style_code_a, content_a)
+            self_gen_b = DomainImageGenerator_B(style_code_b, content_b)
+            loss_self_a = criterion_identity(self_gen_a, real_A)
+            loss_self_b = criterion_identity(self_gen_b, real_B)
+            log_statistics["Self Translation Loss"] = loss_self_a.mean().item() + loss_self_b.mean().item()
+            # TODO GAN loss of loss_self
+            fake_gen_a = DomainImageGenerator_A(style_code_a, content_b)
+            fake_gen_b = DomainImageGenerator_B(style_code_b, content_a)
+            loss_gen_adv_a = criterion_GAN(DomainDiscriminator_A(fake_gen_a), valid)
+            loss_gen_adv_b = criterion_GAN(DomainDiscriminator_B(fake_gen_b), valid)
+            log_statistics["Self Translation ADV Loss"] = loss_gen_adv_a.mean().item() + loss_gen_adv_b.mean().item()
 
-            loss_domain_A.backward()
-            loss_domain_B.backward()
-            optimizer_DomainA.step()
-            optimizer_DomainB.step()
+            # Image Cycle Consistency loss
+            fake_gen_a_iterm = DomainEncoder_A(fake_gen_a)
+            fake_gen_b_iterm = DomainEncoder_B(fake_gen_b)
+            fake_gen_a_style_mu, fake_gen_a_style_logvar = DomainStyleExtractor_A(fake_gen_a_iterm)
+            fake_gen_b_style_mu, fake_gen_b_style_logvar = DomainStyleExtractor_B(fake_gen_b_iterm)
+            fake_gen_a_style = image_gaussian_reparameterize_sample(fake_gen_a_style_mu, fake_gen_a_style_logvar)
+            fake_gen_b_style = image_gaussian_reparameterize_sample(fake_gen_b_style_mu, fake_gen_b_style_logvar)
+            fake_gen_a_content = ImageContentExtractor(fake_gen_a_iterm)
+            fake_gen_b_content = ImageContentExtractor(fake_gen_b_iterm)
+            cycle_a = DomainImageGenerator_A(fake_gen_a_style, fake_gen_b_content)
+            cycle_b = DomainImageGenerator_B(fake_gen_b_style, fake_gen_a_content)
+            loss_cycle_a = criterion_identity(real_A, cycle_a)
+            loss_cycle_b = criterion_identity(real_B, cycle_b)
+            log_statistics["Cycle Consistency Loss"] = loss_cycle_a.mean().item() + loss_cycle_b.mean().item()
+            loss_cycle_a_adv = criterion_GAN(DomainDiscriminator_A(cycle_a), valid)
+            loss_cycle_b_adv = criterion_GAN(DomainDiscriminator_B(cycle_b), valid)
+            log_statistics["Cycle Consistency ADV Loss"] = loss_cycle_a_adv.mean().item() + loss_cycle_b_adv.mean().item()
+
+            # Style Self-Translation loss
+            random_style_a = Variable(Tensor(np.random.normal(0, 1, style_code_a_mu.shape)))
+            random_style_b = Variable(Tensor(np.random.normal(0, 1, style_code_a_mu.shape)))
+            s_image_a = DomainImageGenerator_A(random_style_a, content_a)
+            s_image_b = DomainImageGenerator_B(random_style_b, content_b)
+            # TODO GAN loss of s_image
+            s_image_a_iterm = DomainEncoder_A(s_image_a)
+            s_image_b_iterm = DomainEncoder_B(s_image_b)
+            s_image_a_style_mu, _ = DomainStyleExtractor_A(s_image_a_iterm)
+            s_image_b_style_mu, _ = DomainStyleExtractor_B(s_image_b_iterm)
+            loss_style_recons_a = criterion_identity(random_style_a, s_image_a_style_mu)
+            loss_style_recons_b = criterion_identity(random_style_b, s_image_b_style_mu)
+            log_statistics["Style Self-Translation Loss"] = loss_style_recons_a.mean().item() + loss_style_recons_b.mean().item()
+
+            # total loss
+            loss_sum = (loss_ae_id_A + loss_ae_id_B) * opt.lambda_ae + (loss_ae_adv_A + loss_ae_adv_B) * opt.lambda_gan + \
+                       (loss_kld_a + loss_kld_b) * opt.lambda_kld + \
+                       (loss_self_a + loss_self_b) * opt.lambda_self + (loss_gen_adv_a + loss_gen_adv_b) * opt.lambda_gan + \
+                       (loss_cycle_a + loss_cycle_b) * opt.lambda_cycle + (loss_cycle_a_adv + loss_cycle_b_adv) * opt.lambda_gan + \
+                       (loss_style_recons_a + loss_style_recons_b) * opt.lambda_style
+            loss_sum.backward()
+            optimizer_MainModel.step()
 
 
             # -----------------------
@@ -258,6 +349,7 @@ def main():
             fake_A_ = fake_A_buffer.push_and_pop(fake_A)
             loss_fake = criterion_GAN(DomainDiscriminator_A(fake_A_.detach()), fake)
             loss_D_A = (loss_real + loss_fake) / 2
+            log_statistics["Discriminator A Loss"] = loss_D_A.mean().item()
             loss_D_A.backward()
             optimizer_DomainA_Dis.step()
 
@@ -270,6 +362,7 @@ def main():
             fake_B_ = fake_A_buffer.push_and_pop(fake_B)
             loss_fake = criterion_GAN(DomainDiscriminator_B(fake_B_.detach()), fake)
             loss_D_B = (loss_real + loss_fake) / 2
+            log_statistics["Discriminator B Loss"] = loss_D_B.mean().item()
             loss_D_B.backward()
             optimizer_DomainB_Dis.step()
 
@@ -285,16 +378,13 @@ def main():
 
             # Print log
             sys.stdout.write(
-                "\r[Epoch %d/%d] [Batch %d/%d] [D loss: %f] [AE loss: %f, adv: %f, identity: %f] ETA: %s"
+                "\r[Epoch %d/%d] [Batch %d/%d] [%s] ETA: %s"
                 % (
                     epoch,
                     opt.n_epochs,
                     i,
                     len(dataloader),
-                    (loss_D_A + loss_D_B).item(),
-                    (loss_domain_A + loss_domain_B).item(),
-                    (loss_GAN_A + loss_GAN_B).item(),
-                    (loss_aec_id_A + loss_aec_id_B).item(),
+                    str(log_statistics),
                     time_left,
                 )
             )
@@ -304,8 +394,7 @@ def main():
                 sample_images(batches_done)
 
         # Update learning rates
-        lr_scheduler_DomainA.step()
-        lr_scheduler_DomainB.step()
+        lr_scheduler_MainModel.step()
         lr_scheduler_DomainA_Dis.step()
         lr_scheduler_DomainB_Dis.step()
 
